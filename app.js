@@ -1,6 +1,16 @@
-// ---------- Data ----------
-const STORAGE_KEY = "recurring-log-data-v1";
+// ============================================================
+// CONFIG
+// ============================================================
+const GOOGLE_CLIENT_ID = "152893984760-qlc6hvdlusademktqoo7jdjbiebij4qc.apps.googleusercontent.com";
+const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.appdata";
+const DRIVE_FILE_NAME = "recurring-log-data.json";
 
+const STORAGE_KEY = "recurring-log-data-v1";
+const SETTINGS_KEY = "recurring-log-settings-v1";
+
+// ============================================================
+// DEFAULT DATA
+// ============================================================
 const CATEGORY_PRESETS = [
   { id: "home", name: "Home", icon: "🔥", color: "#D9683C" },
   { id: "vehicle", name: "Vehicle", icon: "🏍️", color: "#3C7A89" },
@@ -15,40 +25,145 @@ const SEED_ITEMS = [
   { id: "3", name: "Water Filter Service", categoryId: "water", history: [] },
 ];
 
-let state = loadState();
+// ============================================================
+// STATE
+// ============================================================
+// data shape: { categories: [...], items: [...], updatedAt: number }
+let state = loadLocalState();
+let settings = loadSettings();
 
-function loadState() {
+// UI-only state (not persisted)
+let expanded = {};
+let addingTo = null;
+let logDateFor = null;
+let logDateValue = "";
+let movingItem = null;
+
+// sync state
+let accessToken = null;
+let driveFileId = null;
+let syncStatusState = "idle"; // idle | online | offline | syncing | error
+let syncInProgress = false;
+let pendingSync = false;
+
+// ============================================================
+// PERSISTENCE - LOCAL
+// ============================================================
+function loadLocalState() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
       if (parsed && Array.isArray(parsed.items) && Array.isArray(parsed.categories)) {
+        if (!parsed.updatedAt) parsed.updatedAt = Date.now();
         return parsed;
       }
     }
   } catch (e) {
-    console.error("Failed to load state", e);
+    console.error("Failed to load local state", e);
   }
-  return { categories: CATEGORY_PRESETS, items: SEED_ITEMS };
+  return { categories: CATEGORY_PRESETS, items: SEED_ITEMS, updatedAt: Date.now() };
 }
 
-function saveState() {
+function saveLocalState() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   } catch (e) {
-    console.error("Failed to save state", e);
+    console.error("Failed to save local state", e);
   }
 }
 
-// UI-only state (not persisted)
-let expanded = {};
-let addingTo = null;
-let newItemName = "";
-let logDateFor = null;
-let logDateValue = "";
-let movingItem = null;
+function loadSettings() {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {}
+  return { storageMode: "local" }; // "local" | "drive"
+}
 
-// ---------- Helpers ----------
+function saveSettings() {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  } catch (e) {}
+}
+
+// Call this after any data mutation
+function commitChange() {
+  state.updatedAt = Date.now();
+  saveLocalState();
+  render();
+  if (settings.storageMode === "drive") {
+    scheduleSync();
+  }
+}
+
+// ============================================================
+// MERGE LOGIC (for combining local + remote when both have changes)
+// ============================================================
+function mergeStates(local, remote) {
+  if (!remote) return local;
+  if (!local) return remote;
+
+  const catMap = {};
+  (remote.categories || []).forEach((c) => (catMap[c.id] = c));
+  (local.categories || []).forEach((c) => (catMap[c.id] = catMap[c.id] || c));
+  const categories = Object.values(catMap);
+
+  const itemMap = {};
+
+  function ingest(items) {
+    (items || []).forEach((it) => {
+      if (!itemMap[it.id]) {
+        itemMap[it.id] = {
+          id: it.id,
+          name: it.name,
+          categoryId: it.categoryId,
+          history: it.history ? it.history.slice() : [],
+          deleted: !!it.deleted,
+        };
+      } else {
+        const existing = itemMap[it.id];
+        // merge history by union of dates
+        const histSet = new Set(existing.history);
+        (it.history || []).forEach((d) => histSet.add(d));
+        existing.history = Array.from(histSet).sort().reverse();
+        // deleted wins if either side deleted
+        if (it.deleted) existing.deleted = true;
+        // categoryId / name: prefer whichever record is "newer" - use remote vs local timestamps as tiebreak
+        // simple approach: keep existing unless this one looks more "current" (no good signal) - keep first seen
+      }
+    });
+  }
+
+  // ingest remote first (baseline), then local (local edits to name/category take precedence)
+  ingest(remote.items);
+  (local.items || []).forEach((it) => {
+    if (itemMap[it.id]) {
+      itemMap[it.id].name = it.name;
+      itemMap[it.id].categoryId = it.categoryId;
+      if (it.deleted) itemMap[it.id].deleted = true;
+      const histSet = new Set(itemMap[it.id].history);
+      (it.history || []).forEach((d) => histSet.add(d));
+      itemMap[it.id].history = Array.from(histSet).sort().reverse();
+    } else {
+      itemMap[it.id] = {
+        id: it.id,
+        name: it.name,
+        categoryId: it.categoryId,
+        history: it.history ? it.history.slice() : [],
+        deleted: !!it.deleted,
+      };
+    }
+  });
+
+  const items = Object.values(itemMap).filter((it) => !it.deleted);
+
+  return { categories, items, updatedAt: Date.now() };
+}
+
+// ============================================================
+// HELPERS
+// ============================================================
 function fmtDate(dateStr) {
   const d = new Date(dateStr);
   return d.toLocaleDateString("en-US", { day: "numeric", month: "short", year: "numeric" });
@@ -83,7 +198,16 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
-// ---------- Actions ----------
+function showToast(msg) {
+  const toast = document.getElementById("toast");
+  toast.textContent = msg;
+  toast.classList.add("show");
+  setTimeout(() => toast.classList.remove("show"), 2200);
+}
+
+// ============================================================
+// ACTIONS (data mutation)
+// ============================================================
 function toggleExpand(id) {
   expanded[id] = !expanded[id];
   render();
@@ -91,7 +215,6 @@ function toggleExpand(id) {
 
 function startAdd(categoryId) {
   addingTo = categoryId;
-  newItemName = "";
   render();
   const input = document.querySelector(`[data-add-input="${categoryId}"]`);
   if (input) input.focus();
@@ -99,7 +222,6 @@ function startAdd(categoryId) {
 
 function cancelAdd() {
   addingTo = null;
-  newItemName = "";
   render();
 }
 
@@ -109,9 +231,8 @@ function addItem(categoryId) {
   if (!value) return;
   const newItem = { id: String(Date.now()), name: value, categoryId, history: [] };
   state.items.push(newItem);
-  saveState();
   addingTo = null;
-  render();
+  commitChange();
 }
 
 function startLog(itemId) {
@@ -134,26 +255,25 @@ function saveLog(itemId) {
     item.history.push(dateStr);
     item.history.sort();
     item.history.reverse();
-    saveState();
   }
   logDateFor = null;
-  render();
+  commitChange();
 }
 
 function deleteEntry(itemId, dateStr) {
   const item = state.items.find((it) => it.id === itemId);
   if (item) {
     item.history = item.history.filter((d) => d !== dateStr);
-    saveState();
   }
-  render();
+  commitChange();
 }
 
 function deleteItem(itemId) {
   if (!confirm("Delete this item and all its history?")) return;
+  const item = state.items.find((it) => it.id === itemId);
+  if (item) item.deleted = true;
   state.items = state.items.filter((it) => it.id !== itemId);
-  saveState();
-  render();
+  commitChange();
 }
 
 function startMove(itemId) {
@@ -168,15 +288,287 @@ function cancelMove() {
 
 function moveItem(itemId, newCategoryId) {
   const item = state.items.find((it) => it.id === itemId);
-  if (item) {
-    item.categoryId = newCategoryId;
-    saveState();
-  }
+  if (item) item.categoryId = newCategoryId;
   movingItem = null;
-  render();
+  commitChange();
 }
 
-// ---------- Rendering ----------
+// ============================================================
+// GOOGLE DRIVE SYNC
+// ============================================================
+let tokenClient = null;
+
+function initGoogleClient() {
+  if (typeof google === "undefined" || !google.accounts) {
+    setTimeout(initGoogleClient, 300);
+    return;
+  }
+  tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: GOOGLE_CLIENT_ID,
+    scope: DRIVE_SCOPE,
+    callback: (resp) => {
+      if (resp.error) {
+        console.error("Token error", resp);
+        setSyncStatus("error");
+        return;
+      }
+      accessToken = resp.access_token;
+      onSignedIn();
+    },
+  });
+
+  // try silent sign-in if previously connected
+  if (settings.storageMode === "drive") {
+    requestToken(true);
+  }
+}
+
+function requestToken(silent) {
+  if (!tokenClient) return;
+  try {
+    tokenClient.requestAccessToken({ prompt: silent ? "none" : "consent" });
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+function onSignedIn() {
+  showToast("Connected to Google Drive");
+  syncWithDrive().then(() => {
+    settings.storageMode = "drive";
+    saveSettings();
+    closeSettings();
+    render();
+  });
+}
+
+function setSyncStatus(s) {
+  syncStatusState = s;
+  renderSyncStatus();
+}
+
+function renderSyncStatus() {
+  const el = document.getElementById("syncStatus");
+  if (!el) return;
+  if (settings.storageMode === "local") {
+    el.innerHTML = `<span class="sync-dot offline"></span> Saved on this device`;
+    return;
+  }
+  let label = "";
+  let dotClass = "offline";
+  if (!navigator.onLine) {
+    label = "Offline — changes saved locally, will sync when back online";
+    dotClass = "offline";
+  } else if (syncStatusState === "syncing") {
+    label = "Syncing with Google Drive…";
+    dotClass = "syncing";
+  } else if (syncStatusState === "error") {
+    label = "Sync error — will retry";
+    dotClass = "error";
+  } else {
+    label = "Synced with Google Drive";
+    dotClass = "online";
+  }
+  el.innerHTML = `<span class="sync-dot ${dotClass}"></span> ${label}`;
+}
+
+// Find or create the app data file on Drive
+async function getOrCreateDriveFile() {
+  const listRes = await fetch(
+    `https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name='${DRIVE_FILE_NAME}'&fields=files(id,name)`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+  if (!listRes.ok) throw new Error("Drive list failed: " + listRes.status);
+  const listData = await listRes.json();
+  if (listData.files && listData.files.length > 0) {
+    return listData.files[0].id;
+  }
+
+  // create new file
+  const metadata = { name: DRIVE_FILE_NAME, parents: ["appDataFolder"] };
+  const createRes = await fetch("https://www.googleapis.com/drive/v3/files?fields=id", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(metadata),
+  });
+  if (!createRes.ok) throw new Error("Drive create failed: " + createRes.status);
+  const createData = await createRes.json();
+  return createData.id;
+}
+
+async function downloadDriveFile(fileId) {
+  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error("Drive download failed: " + res.status);
+  const text = await res.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    return null;
+  }
+}
+
+async function uploadDriveFile(fileId, data) {
+  const res = await fetch(
+    `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
+    {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(data),
+    }
+  );
+  if (!res.ok) throw new Error("Drive upload failed: " + res.status);
+}
+
+async function syncWithDrive() {
+  if (!accessToken) {
+    requestToken(true);
+    return;
+  }
+  if (syncInProgress) {
+    pendingSync = true;
+    return;
+  }
+  if (!navigator.onLine) {
+    setSyncStatus("offline");
+    return;
+  }
+
+  syncInProgress = true;
+  setSyncStatus("syncing");
+
+  try {
+    if (!driveFileId) {
+      driveFileId = await getOrCreateDriveFile();
+    }
+    const remote = await downloadDriveFile(driveFileId);
+    const merged = mergeStates(state, remote);
+
+    state = merged;
+    saveLocalState();
+    await uploadDriveFile(driveFileId, state);
+
+    setSyncStatus("online");
+    render();
+  } catch (e) {
+    console.error("Sync error", e);
+    setSyncStatus("error");
+  } finally {
+    syncInProgress = false;
+    if (pendingSync) {
+      pendingSync = false;
+      syncWithDrive();
+    }
+  }
+}
+
+let syncDebounceTimer = null;
+function scheduleSync() {
+  if (syncDebounceTimer) clearTimeout(syncDebounceTimer);
+  syncDebounceTimer = setTimeout(() => {
+    syncWithDrive();
+  }, 1200);
+}
+
+function disconnectDrive() {
+  settings.storageMode = "local";
+  accessToken = null;
+  driveFileId = null;
+  saveSettings();
+  setSyncStatus("idle");
+  renderSyncStatus();
+  closeSettings();
+  showToast("Switched to this device only");
+}
+
+// ============================================================
+// ONLINE/OFFLINE LISTENERS
+// ============================================================
+window.addEventListener("online", () => {
+  if (settings.storageMode === "drive") {
+    syncWithDrive();
+  } else {
+    renderSyncStatus();
+  }
+});
+window.addEventListener("offline", () => {
+  renderSyncStatus();
+});
+
+// ============================================================
+// SETTINGS MODAL
+// ============================================================
+let modalSelection = null;
+
+function openSettings() {
+  modalSelection = settings.storageMode;
+  updateModalUI();
+  document.getElementById("settingsModal").classList.remove("hidden");
+}
+
+function closeSettings() {
+  document.getElementById("settingsModal").classList.add("hidden");
+}
+
+function selectStorageOption(mode) {
+  modalSelection = mode;
+  updateModalUI();
+}
+
+function updateModalUI() {
+  const localOpt = document.getElementById("optionLocal");
+  const driveOpt = document.getElementById("optionDrive");
+  const actionBtn = document.getElementById("settingsActionBtn");
+  const accountRow = document.getElementById("accountRow");
+
+  localOpt.classList.toggle("selected", modalSelection === "local");
+  driveOpt.classList.toggle("selected", modalSelection === "drive");
+
+  if (modalSelection === "local") {
+    actionBtn.textContent = settings.storageMode === "drive" ? "Switch to this device" : "Selected";
+    actionBtn.style.display = settings.storageMode === "drive" ? "block" : "none";
+  } else {
+    if (settings.storageMode === "drive" && accessToken) {
+      actionBtn.textContent = "Sync now";
+    } else {
+      actionBtn.textContent = "Connect Google Drive";
+    }
+    actionBtn.style.display = "block";
+  }
+
+  if (settings.storageMode === "drive" && accessToken) {
+    accountRow.innerHTML = `<div class="account-row">☁️ Connected to Google Drive &nbsp; <button class="link-btn danger" style="margin-left:auto" onclick="disconnectDrive()">Disconnect</button></div>`;
+  } else {
+    accountRow.innerHTML = "";
+  }
+}
+
+function settingsAction() {
+  if (modalSelection === "local") {
+    if (settings.storageMode === "drive") disconnectDrive();
+    else closeSettings();
+  } else {
+    if (settings.storageMode === "drive" && accessToken) {
+      syncWithDrive();
+      closeSettings();
+    } else {
+      requestToken(false);
+    }
+  }
+}
+
+// ============================================================
+// RENDERING
+// ============================================================
 function renderIntervalChart(item, color) {
   const gaps = getGaps(item.history);
   if (gaps.length === 0) return "";
@@ -206,7 +598,6 @@ function renderItem(item, cat) {
 
   let html = `<div>`;
 
-  // Row
   html += `<div class="item-row">`;
   html += `<button class="item-main" onclick="toggleExpand('${item.id}')">`;
   html += `<svg class="chevron ${isOpen ? "open" : ""}" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"></polyline></svg>`;
@@ -221,7 +612,6 @@ function renderItem(item, cat) {
   html += `<button class="log-btn" style="background:${cat.color}" onclick="startLog('${item.id}')">+ Log</button>`;
   html += `</div>`;
 
-  // Log date row
   if (logDateFor === item.id) {
     html += `<div class="log-date-row">`;
     html += `<input type="date" data-log-input="${item.id}" value="${logDateValue}" />`;
@@ -230,7 +620,6 @@ function renderItem(item, cat) {
     html += `</div>`;
   }
 
-  // Expanded panel
   if (isOpen) {
     html += `<div class="expanded-panel">`;
     html += renderIntervalChart(item, cat.color);
@@ -309,8 +698,13 @@ function render() {
   state.categories.forEach((cat) => {
     html += renderCategory(cat);
   });
-  html += `<p class="footer-note">Your data is saved on this device.</p>`;
+  html += `<p class="footer-note">${settings.storageMode === "drive" ? "Synced with your Google Drive." : "Your data is saved on this device."}</p>`;
   app.innerHTML = html;
+  renderSyncStatus();
 }
 
+// ============================================================
+// INIT
+// ============================================================
 render();
+initGoogleClient();

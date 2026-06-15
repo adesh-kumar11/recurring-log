@@ -18,6 +18,7 @@
     --light: #F0EBE2;
     --danger: #C0563E;
     --input-bg: #FBF9F5;
+    --accent: #D9683C;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body { margin: 0; padding: 0; }
@@ -29,24 +30,41 @@
     padding-bottom: env(safe-area-inset-bottom);
   }
   header {
-    padding: 28px 20px 20px;
+    padding: 28px 20px 16px;
     border-bottom: 1px solid var(--border);
     position: sticky;
     top: 0;
     background: var(--bg);
     z-index: 10;
   }
+  .header-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
   header h1 {
     font-size: 24px;
     font-weight: 700;
     margin: 0 0 4px;
     letter-spacing: -0.01em;
   }
-  header p {
+  header p.subtitle {
     font-size: 13px;
     color: var(--muted);
     margin: 0;
   }
+  .settings-btn {
+    border: none; background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 8px; color: var(--muted); cursor: pointer;
+    flex-shrink: 0; display: flex; align-items: center;
+  }
+  .sync-status {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--muted2); margin-top: 10px;
+  }
+  .sync-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted2); flex-shrink: 0; }
+  .sync-dot.online { background: #5C9E6B; }
+  .sync-dot.offline { background: var(--muted2); }
+  .sync-dot.syncing { background: var(--accent); animation: pulse 1s infinite; }
+  .sync-dot.error { background: var(--danger); }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
   main {
     padding: 16px;
     max-width: 640px;
@@ -157,15 +175,92 @@
     padding: 8px 0 32px;
   }
   svg { display: block; }
+
+  /* Settings modal */
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(43,38,32,0.4);
+    display: flex; align-items: flex-end; justify-content: center;
+    z-index: 100;
+  }
+  .modal-overlay.hidden { display: none; }
+  .modal-sheet {
+    background: var(--card); border-radius: 20px 20px 0 0;
+    width: 100%; max-width: 640px; padding: 20px;
+    max-height: 85vh; overflow-y: auto;
+  }
+  .modal-sheet h2 { margin: 0 0 4px; font-size: 18px; }
+  .modal-sheet p.desc { font-size: 13px; color: var(--muted); margin: 0 0 16px; }
+  .storage-option {
+    border: 1px solid var(--border); border-radius: 14px; padding: 14px;
+    margin-bottom: 12px; cursor: pointer;
+  }
+  .storage-option.selected { border-color: var(--accent); background: #D9683C0D; }
+  .storage-option h3 { margin: 0 0 4px; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+  .storage-option p { margin: 0; font-size: 12px; color: var(--muted); }
+  .modal-actions { display: flex; gap: 10px; margin-top: 8px; }
+  .modal-btn {
+    flex: 1; padding: 12px; border-radius: 12px; font-size: 14px; font-weight: 600;
+    border: none; cursor: pointer;
+  }
+  .modal-btn.primary { background: var(--accent); color: white; }
+  .modal-btn.secondary { background: var(--light); color: var(--text); }
+  .account-row {
+    display: flex; align-items: center; gap: 10px; padding: 10px;
+    background: var(--input-bg); border-radius: 12px; margin-bottom: 12px; font-size: 13px;
+  }
+  .account-row img { width: 28px; height: 28px; border-radius: 50%; }
+  .toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: var(--text); color: white; padding: 10px 18px; border-radius: 999px;
+    font-size: 13px; z-index: 200; opacity: 0; transition: opacity 0.2s;
+    pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
 </style>
 </head>
 <body>
 <header>
-  <h1>Recurring Log</h1>
-  <p>Track when you last did it — gas refills, servicing, filters, anything periodic.</p>
+  <div class="header-top">
+    <div>
+      <h1>Recurring Log</h1>
+      <p class="subtitle">Track when you last did it — gas refills, servicing, filters, anything periodic.</p>
+    </div>
+    <button class="settings-btn" onclick="openSettings()" aria-label="Settings">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+    </button>
+  </div>
+  <div class="sync-status" id="syncStatus"></div>
 </header>
 <main id="app"></main>
 
+<!-- Settings Modal -->
+<div class="modal-overlay hidden" id="settingsModal">
+  <div class="modal-sheet">
+    <h2>Storage</h2>
+    <p class="desc">Choose where your activity history is saved.</p>
+
+    <div id="accountRow"></div>
+
+    <div class="storage-option" id="optionLocal" onclick="selectStorageOption('local')">
+      <h3>📱 This device only</h3>
+      <p>Saved locally. Works fully offline. Not backed up — clearing browser data deletes it.</p>
+    </div>
+
+    <div class="storage-option" id="optionDrive" onclick="selectStorageOption('drive')">
+      <h3>☁️ Google Drive</h3>
+      <p>Saved to your own Google Drive (private app file). Works offline, syncs automatically when you're back online. Sign-in required.</p>
+    </div>
+
+    <div class="modal-actions">
+      <button class="modal-btn secondary" onclick="closeSettings()">Close</button>
+      <button class="modal-btn primary" id="settingsActionBtn" onclick="settingsAction()">Connect</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <script src="app.js"></script>
 <script>
   if ("serviceWorker" in navigator) {
@@ -174,6 +269,5 @@
     });
   }
 </script>
-
 </body>
 </html>

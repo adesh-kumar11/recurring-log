@@ -1,4 +1,4 @@
-const CACHE_NAME = "recurring-log-v1";
+const CACHE_NAME = "recurring-log-v2";
 const ASSETS = [
   "./index.html",
   "./app.js",
@@ -24,6 +24,11 @@ self.addEventListener("activate", (event) => {
 });
 
 self.addEventListener("fetch", (event) => {
+  const url = new URL(event.request.url);
+  // Don't cache Google API calls - always go to network
+  if (url.hostname.includes("googleapis.com") || url.hostname.includes("google.com")) {
+    return;
+  }
   event.respondWith(
     caches.match(event.request).then((cached) => cached || fetch(event.request))
   );
